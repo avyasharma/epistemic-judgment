@@ -7,7 +7,6 @@ from typing import List
 from dotenv import load_dotenv
 
 
-import kagglehub
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
