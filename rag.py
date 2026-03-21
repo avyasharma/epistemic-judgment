@@ -11,6 +11,8 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 
+print("Loading environment variables...")
+
 load_dotenv()
 
 # --- Configuration ---
