@@ -1,4 +1,5 @@
 import os
+import json
 import faiss
 import numpy as np
 import pandas as pd
@@ -17,8 +18,6 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 HUGGING_FACE_KEY = os.getenv("HUGGING_FACE_KEY")
 BASE_URL = os.getenv("BASE_URL")
-
-# openai.OpenAI(api_key=api_key,  base_url=base_url)
 
 class OpenAIClient():
     def __init__(self, model: str = "gpt-5-mini"):
@@ -95,13 +94,13 @@ class VanillaRAG:
         self.retriever = retriever
         self.generator = generator
 
-    def answer(self, query: str, top_k: int = 5) -> str:
+    def answer(self, query: str, top_k: int = 5) -> tuple[str, List[str]]:
         passages = self.retriever.retrieve(query, top_k=top_k)
         
         for i, passage in enumerate(passages):
              print(f"  -> Passage {i+1}: {passage[:100]}...")
         
-        return self.generator.generate(query, passages)
+        return self.generator.generate(query, passages), passages
 
 # --- Kaggle Dataset Loader ---
 
@@ -152,23 +151,27 @@ def main():
     questions = questions_df["question"].tolist()
     answers = questions_df["answer"].tolist()
 
-    # # Add documents to the FAISS index (limiting to 500 for a fast demo)
+    print("Adding documents to retriever...")
+
     retriever.add_documents(documents)
 
-    print("DATA LOADED")
+    outputs = {}
+
+    for i in range(len(questions)):
+        response, passages = rag_pipeline.answer(questions[i], top_k=5)
+        
+        outputs[i] = {
+            "question": questions[i],
+            "gold answer": answers[i],
+            "response": response,
+            "retrieved_context": passages
+        }
+
+        print(f"Done with Question {i+1}/{len(questions)}")
+
+    with open("outputs.json", "w") as f:
+        json.dump(outputs, f)
     
-    # # 3. Test the Pipeline
-    # # Swap out for a query relevant to the Kaggle dataset
-    # query = "What is the capital of France?" 
-    
-    try:
-        response = rag_pipeline.answer(questions[0], top_k=3)
-        print("\n--- Final Output ---")
-        print(response)
-    except Exception as e:
-        print(f"\n[Error] Pipeline execution failed: {e}")
-        print("\nMake sure you have set the OPENAI_API_KEY and installed dependencies:")
-        print("pip install openai faiss-cpu sentence-transformers pandas")
 
 if __name__ == "__main__":
     main()
