@@ -340,56 +340,21 @@ def summarize_rag_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
-def load_inference_jsonl(path):
-    questions = []
-    gold_answers = []
-    predicted_answers = []
-    retrieved_contexts = []
-
+def load_inference_json(path):
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            ex = json.loads(line)
-            questions.append(ex["question"])
-            gold_answers.append(ex["gold_answer"])
-            predicted_answers.append(ex["predicted_answer"])
-            retrieved_contexts.append(ex["retrieved_context"])
+        data = json.load(f)
+
+    questions = [ex["question"] for ex in data.values()]
+    gold_answers = [ex["gold answer"] for ex in data.values()]
+    predicted_answers = [ex["response"] for ex in data.values()]
+    retrieved_contexts = [ex["retrieved_context"] for ex in data.values()]
 
     return questions, gold_answers, predicted_answers, retrieved_contexts
 
 
 if __name__ == "__main__":
     
-    #replace "inference_results.jsonl" with avi's output file
-    # questions, gold_answers, predicted_answers, retrieved_contexts = load_inference_jsonl("inference_results.jsonl")
-    questions = [
-        "What is the capital of France?",
-        "Who wrote Hamlet?",
-    ]
-
-    gold_answers = [
-        "Paris is the capital of France.",
-        "William Shakespeare wrote Hamlet.",
-    ]
-
-    predicted_answers = [
-        "Paris is the capital of France.",
-        "Hamlet was written by Shakespeare.",
-    ]
-
-    retrieved_contexts = [
-        [
-            "France is a country in Europe.",
-            "Paris is the capital and largest city of France.",
-        ],
-        [
-            "Hamlet is a tragedy written by William Shakespeare sometime between 1599 and 1601.",
-        ],
-    ]
-
-    gold_contexts_list = [
-        ["Paris is the capital and largest city of France."],
-        ["Hamlet is a tragedy written by William Shakespeare sometime between 1599 and 1601."],
-    ]
+    questions, gold_answers, predicted_answers, retrieved_contexts = load_inference_json("outputs.json")
 
     results = evaluate_rag_batch(
         questions=questions,
