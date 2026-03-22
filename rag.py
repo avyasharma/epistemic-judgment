@@ -123,15 +123,31 @@ def load_kaggle_rag_dataset(file_path: str) -> List[str]:
     print("DONE")
     return documents
 
+def build_rag_pipeline(document_path: str, embedding_model: str, llm_model: str) -> VanillaRAG:
+    print("Initializing retriever...")
+    retriever = DocumentRetriever(model_name=embedding_model)
+
+    print("Initializing generator...")
+    generator = OpenAIClient(model=llm_model)
+
+    print("Loading documents...")
+    documents = load_kaggle_rag_dataset(document_path)
+    print(f"Loaded {len(documents)} raw documents")
+
+    print("Adding documents to retriever (chunking + embedding + indexing)...")
+    retriever.add_documents(documents)
+    print(f"Indexed {len(retriever.documents)} chunks")
+
+    print("RAG pipeline ready.")
+    return VanillaRAG(retriever, generator)
+
 def main():
     # First, we need to set up the components of the RAG system
-    retriever = DocumentRetriever() 
-    generator = OpenAIClient() 
-    rag_pipeline = VanillaRAG(retriever, generator)
-    
-    # We then need to load the dataset, itself.
-    document_path = "dataset/documents.csv"
-    documents = load_kaggle_rag_dataset(document_path)
+    build_rag_pipeline(
+        document_path="dataset/documents.csv",
+        embedding_model="all-MiniLM-L6-v2",
+        llm_model="gpt-5-mini",
+    )
 
     # Load all question datasets directly with pandas
     multi_df = pd.read_csv("dataset/multi_passage_answer_questions.csv")
@@ -151,10 +167,6 @@ def main():
     # Extract questions and answers as lists for the evaluator
     questions = questions_df["question"].tolist()
     answers = questions_df["answer"].tolist()
-
-    print("Adding documents to retriever...")
-
-    retriever.add_documents(documents)
 
     outputs = {}
 

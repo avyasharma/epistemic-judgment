@@ -12,3 +12,4 @@ pandas
 python-dotenv
 openai
 sentence-transformers
+streamlit
