@@ -32,7 +32,7 @@ class OpenAIClient():
         system_prompt = (
             "You are a helpful, accurate, and concise assistant. "
             "Use the provided context to answer the user's query. "
-            "If the answer is not contained in the context, clearly state that you cannot find the answer in the provided context."
+            "If the answer is not contained in the context, clearly state 'I don't know.'""
         )
         
         user_prompt = f"Context:\n{context_str}\n\nQuery: {query}"
