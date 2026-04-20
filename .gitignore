@@ -7,3 +7,4 @@ __pycache__/".env"
 ".xlsx"
 "*.xlsx" 
 "*.json" 
+__pycache__/
