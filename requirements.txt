@@ -9,7 +9,9 @@ scipy>=1.10
 faiss-cpu
 numpy
 pandas
+openpyxl
 python-dotenv
 openai
 sentence-transformers
 streamlit
+tqdm>=4.66

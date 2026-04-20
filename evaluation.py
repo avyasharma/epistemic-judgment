@@ -1,10 +1,17 @@
-import re
+import argparse
 import json
+import math
+import re
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 import evaluate
+from scipy import stats
 
 _BERTSCORE = evaluate.load("bertscore")
+
+# Default judge weights (match epistemic_gated_rag.EpistemicJudge)
+_EPISTEMIC_WEIGHTS = (0.35, 0.45, 0.20)
 
 
 
@@ -37,6 +44,167 @@ def as_chunk_list(context: Union[str, List[str], None]) -> List[str]:
 
 def join_chunks(context: Union[str, List[str], None]) -> str:
     return "\n".join(as_chunk_list(context))
+
+
+# =========================
+# Inference JSON loading (vanilla RAG + epistemic gated)
+# =========================
+
+
+def _sort_example_items(data: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    def key_fn(item: Tuple[str, Any]) -> Tuple[int, Union[int, str]]:
+        k = item[0]
+        try:
+            return (0, int(k))
+        except (TypeError, ValueError):
+            return (1, str(k))
+
+    return sorted(data.items(), key=key_fn)
+
+
+def gold_answer_from_example(ex: Dict[str, Any]) -> str:
+    for key in ("gold_answer", "gold answer"):
+        v = ex.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    alts = ex.get("gold_answers")
+    if isinstance(alts, list) and alts:
+        return str(alts[0]).strip()
+    return ""
+
+
+def retrieved_context_from_example(ex: Dict[str, Any]) -> Union[str, List[str], None]:
+    return ex.get("retrieved_context") if ex.get("retrieved_context") is not None else ex.get(
+        "retrieved_passages"
+    )
+
+
+def epistemic_numeric_score(ex: Dict[str, Any]) -> Tuple[float, str]:
+    """
+    Map judge output to a single numeric score for correlation with retrieval quality.
+
+    - Structured mode: composite_score on 0–10 when present; else weighted blend of
+      relevance/sufficiency/consistency when those are present.
+    - Otherwise (minimal yes/no): 1.0 if decision is ANSWER else 0.0.
+
+    Returns (score_on_0_to_1_scale, score_source).
+    """
+    comp = ex.get("composite_score")
+    if comp is not None and not (isinstance(comp, float) and math.isnan(comp)):
+        return float(comp) / 10.0, "structured_composite"
+
+    rel = ex.get("relevance_score")
+    suf = ex.get("sufficiency_score")
+    con = ex.get("consistency_score")
+    if rel is not None and suf is not None and con is not None:
+        w_r, w_s, w_c = _EPISTEMIC_WEIGHTS
+        blended = w_r * float(rel) + w_s * float(suf) + w_c * float(con)
+        return blended / 10.0, "structured_dims_weighted"
+
+    dec = str(ex.get("decision", "")).upper()
+    return (1.0 if dec == "ANSWER" else 0.0), "binary_decision"
+
+
+def is_gated_example(ex: Dict[str, Any]) -> bool:
+    return "decision" in ex
+
+
+def load_rag_inference_json(
+    path: str,
+) -> Tuple[List[str], List[str], List[str], List[Union[str, List[str], None]], List[Dict[str, Any]]]:
+    """
+    Load RAG / gated JSON (string-keyed dict of examples), e.g. squad_rag_outputs.json.
+
+    Examples are ordered by numeric key when possible. Returns parallel lists plus
+    raw example dicts (for epistemic fields and optional ids → gold context join).
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object of examples, got {type(data).__name__}")
+
+    questions: List[str] = []
+    gold_answers: List[str] = []
+    predicted_answers: List[str] = []
+    retrieved_contexts: List[Union[str, List[str], None]] = []
+    raw_examples: List[Dict[str, Any]] = []
+
+    for _, ex in _sort_example_items(data):
+        if not isinstance(ex, dict):
+            continue
+        questions.append(str(ex.get("question", "")))
+        gold_answers.append(gold_answer_from_example(ex))
+        pred = ex.get("response")
+        predicted_answers.append("" if pred is None else str(pred))
+        retrieved_contexts.append(retrieved_context_from_example(ex))
+        raw_examples.append(ex)
+
+    return questions, gold_answers, predicted_answers, retrieved_contexts, raw_examples
+
+
+def load_squad_id_to_context(json_path: str) -> Dict[str, List[str]]:
+    """Build ids → gold context passages from SQuAD-style JSON (same schema as rag.load_squad_json_records)."""
+    with open(json_path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    if not isinstance(records, list):
+        raise ValueError(f"Expected JSON array in {json_path}")
+    out: Dict[str, List[str]] = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("ids")
+        if not rid:
+            continue
+        ctx = rec.get("context") or []
+        if isinstance(ctx, list):
+            out[str(rid)] = [str(p) for p in ctx if p is not None and str(p).strip()]
+        else:
+            out[str(rid)] = [str(ctx)]
+    return out
+
+
+def align_gold_contexts_to_examples(
+    raw_examples: List[Dict[str, Any]],
+    id_to_context: Dict[str, List[str]],
+) -> List[Optional[List[str]]]:
+    """One gold passage list per example, matched by ``ids`` when possible."""
+    aligned: List[Optional[List[str]]] = []
+    for ex in raw_examples:
+        rid = ex.get("ids")
+        if rid is None:
+            aligned.append(None)
+            continue
+        key = str(rid).strip()
+        aligned.append(id_to_context.get(key))
+    return aligned
+
+
+def correlation_pearson_spearman(
+    x: Sequence[float],
+    y: Sequence[float],
+) -> Dict[str, Any]:
+    """Pairwise correlation; drops non-finite values."""
+    pairs: List[Tuple[float, float]] = []
+    for a, b in zip(x, y):
+        try:
+            fa, fb = float(a), float(b)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fa) and math.isfinite(fb):
+            pairs.append((fa, fb))
+    if len(pairs) < 2:
+        return {"n": len(pairs), "pearson_r": None, "pearson_p": None, "spearman_r": None, "spearman_p": None}
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    pr, pp = stats.pearsonr(xs, ys)
+    sr, sp = stats.spearmanr(xs, ys)
+    return {
+        "n": len(pairs),
+        "pearson_r": float(pr),
+        "pearson_p": float(pp),
+        "spearman_r": float(sr),
+        "spearman_p": float(sp),
+    }
 
 
 # =========================
@@ -188,6 +356,7 @@ def evaluate_rag_batch(
     gold_contexts_list: Optional[List[Optional[List[str]]]] = None,
     compute_semantic_metrics: bool = True,
     bertscore_lang: str = "en",
+    epistemic_raw_examples: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     n = _validate_equal_lengths(
         questions=questions,
@@ -203,6 +372,12 @@ def evaluate_rag_batch(
         questions=questions,
         gold_contexts_list=gold_contexts_list,
     )
+
+    if epistemic_raw_examples is not None:
+        if len(epistemic_raw_examples) != n:
+            raise ValueError(
+                f"epistemic_raw_examples length {len(epistemic_raw_examples)} must match batch size {n}"
+            )
 
     bertscores: List[Optional[Dict[str, float]]] = [None] * n
     if compute_semantic_metrics:
@@ -261,10 +436,82 @@ def evaluate_rag_batch(
         result["retrieval_metrics"]["chunk_recall"] = retrieval_results["recall"] if retrieval_results else None
         result["retrieval_metrics"]["chunk_f1"] = retrieval_results["f1"] if retrieval_results else None
 
+        atr = result["retrieval_metrics"]["answer_token_recall_in_context"]
+        result["retrieval_metrics"]["retrieval_accuracy_primary"] = atr
+
+        if epistemic_raw_examples is not None:
+            raw = epistemic_raw_examples[i]
+            if is_gated_example(raw):
+                score_0_1, score_src = epistemic_numeric_score(raw)
+                result["epistemic_metrics"] = {
+                    "score_0_1": score_0_1,
+                    "score_source": score_src,
+                    "decision": raw.get("decision"),
+                    "composite_score": raw.get("composite_score"),
+                    "relevance_score": raw.get("relevance_score"),
+                    "sufficiency_score": raw.get("sufficiency_score"),
+                    "consistency_score": raw.get("consistency_score"),
+                }
+
         results.append(result)
 
     return results
 
+
+def epistemic_retrieval_correlation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Correlation between epistemic judge score (0–1) and retrieval accuracy
+    (answer-token recall in retrieved passages, 0–1).
+
+    Only includes examples that have ``epistemic_metrics``.
+    """
+    xs: List[float] = []
+    ys: List[float] = []
+    score_sources: List[str] = []
+    for r in results:
+        em = r.get("epistemic_metrics")
+        if not em:
+            continue
+        xs.append(float(em["score_0_1"]))
+        ys.append(float(r["retrieval_metrics"]["answer_token_recall_in_context"]))
+        score_sources.append(str(em.get("score_source", "")))
+
+    if not xs:
+        return {
+            "n_examples": 0,
+            "note": "No gated examples with epistemic_metrics in results.",
+        }
+
+    corr = correlation_pearson_spearman(xs, ys)
+    src_counts = dict(Counter(score_sources))
+    return {
+        "n_examples": len(xs),
+        "epistemic_score_sources": src_counts,
+        "description": (
+            "Pearson/Spearman between epistemic score (0–1) and answer-token recall in "
+            "retrieved context (higher = gold answer better covered by retrieval)."
+        ),
+        **corr,
+        "chunk_overlap_correlation": _optional_chunk_correlation(results),
+    }
+
+
+def _optional_chunk_correlation(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """If chunk_f1 is available, correlate epistemic score with chunk F1."""
+    xs: List[float] = []
+    ys: List[float] = []
+    for r in results:
+        em = r.get("epistemic_metrics")
+        cf1 = r["retrieval_metrics"].get("chunk_f1")
+        if not em or cf1 is None:
+            continue
+        xs.append(float(em["score_0_1"]))
+        ys.append(float(cf1))
+    if len(xs) < 2:
+        return None
+    out = correlation_pearson_spearman(xs, ys)
+    out["metric"] = "chunk_f1"
+    return out
 
 
 # =========================
@@ -273,27 +520,24 @@ def evaluate_rag_batch(
 
 def summarize_rag_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     def mean(values: List[Optional[float]]) -> Optional[float]:
-        valid = [v for v in values if v is not None]
+        valid = [v for v in values if v is not None and isinstance(v, (int, float)) and math.isfinite(v)]
         if not valid:
             return None
         return sum(valid) / len(valid)
 
-    summary = {
+    summary: Dict[str, Any] = {
         "answer_metrics": {
             "token_precision": mean([r["answer_metrics"]["token_precision"] for r in results]),
             "token_recall": mean([r["answer_metrics"]["token_recall"] for r in results]),
             "token_f1": mean([r["answer_metrics"]["token_f1"] for r in results]),
             "bertscore_precision": mean([
-                r["answer_metrics"]["bertscore_precision"]
-                for r in results
+                r["answer_metrics"].get("bertscore_precision") for r in results
             ]),
             "bertscore_recall": mean([
-                r["answer_metrics"]["bertscore_recall"]
-                for r in results
+                r["answer_metrics"].get("bertscore_recall") for r in results
             ]),
             "bertscore_f1": mean([
-                r["answer_metrics"]["bertscore_f1"]
-                for r in results
+                r["answer_metrics"].get("bertscore_f1") for r in results
             ]),
         },
         "retrieval_metrics": {
@@ -327,49 +571,63 @@ def summarize_rag_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
     }
 
-    chunk_scores = [
-        r["retrieval_metrics"]["chunk_precision_recall_f1"]
-        for r in results
-        if "chunk_precision_recall_f1" in r["retrieval_metrics"]
-    ]
-    if chunk_scores:
-        summary["retrieval_metrics"]["chunk_precision"] = mean([x["precision"] for x in chunk_scores])
-        summary["retrieval_metrics"]["chunk_recall"] = mean([x["recall"] for x in chunk_scores])
-        summary["retrieval_metrics"]["chunk_f1"] = mean([x["f1"] for x in chunk_scores])
+    if any("epistemic_metrics" in r for r in results):
+        summary["epistemic_vs_retrieval"] = epistemic_retrieval_correlation_summary(results)
 
     return summary
 
 
-def load_inference_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    questions = [ex["question"] for ex in data.values()]
-    gold_answers = [ex["gold answer"] for ex in data.values()]
-    predicted_answers = [ex["response"] for ex in data.values()]
-    retrieved_contexts = [ex["retrieved_context"] for ex in data.values()]
-
-    return questions, gold_answers, predicted_answers, retrieved_contexts
+def load_inference_json(path: str) -> Tuple[List[str], List[str], List[str], List[Union[str, List[str], None]]]:
+    """Backward-compatible loader (no raw examples). Prefer :func:`load_rag_inference_json`."""
+    q, g, p, r, _ = load_rag_inference_json(path)
+    return q, g, p, r
 
 
 if __name__ == "__main__":
-    
-    questions, gold_answers, predicted_answers, retrieved_contexts = load_inference_json("outputs.json")
+    parser = argparse.ArgumentParser(description="Evaluate RAG or gated RAG JSON outputs.")
+    parser.add_argument(
+        "--outputs",
+        default="squad_rag_outputs.json",
+        help="Path to RAG or gated JSON (e.g. squad_rag_outputs.json, squad_gated_outputs.json).",
+    )
+    parser.add_argument(
+        "--squad-json",
+        default=None,
+        help="Optional SQuAD records JSON for gold passages (chunk overlap metrics via ids).",
+    )
+    parser.add_argument("--no-bert", action="store_true", help="Skip BERTScore (faster).")
+    parser.add_argument("--print-per-example", action="store_true", help="Print full per-example dicts.")
+    args = parser.parse_args()
+
+    questions, gold_answers, predicted_answers, retrieved_contexts, raw_examples = load_rag_inference_json(
+        args.outputs
+    )
+
+    gold_contexts_list: Optional[List[Optional[List[str]]]] = None
+    if args.squad_json:
+        id_to_ctx = load_squad_id_to_context(args.squad_json)
+        gold_contexts_list = align_gold_contexts_to_examples(raw_examples, id_to_ctx)
+
+    has_gated = any(is_gated_example(ex) for ex in raw_examples)
+    epistemic_raw = raw_examples if has_gated else None
 
     results = evaluate_rag_batch(
         questions=questions,
         gold_answers=gold_answers,
         predicted_answers=predicted_answers,
         retrieved_contexts=retrieved_contexts,
-        compute_semantic_metrics=True,
+        gold_contexts_list=gold_contexts_list,
+        compute_semantic_metrics=not args.no_bert,
         bertscore_lang="en",
+        epistemic_raw_examples=epistemic_raw,
     )
 
     summary = summarize_rag_results(results)
 
-    print("\nPer-example results:")
-    for result in results:
-        print(result)
+    if args.print_per_example:
+        print("\nPer-example results:")
+        for result in results:
+            print(result)
 
     print("\nSummary:")
-    print(summary)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
