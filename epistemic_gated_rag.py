@@ -20,6 +20,14 @@ CLI (see ``python epistemic_gated_rag.py --help``):
     Single run defaults to ``structured_<threshold>`` in the output filename.
     ``--ablations structured_5,structured_6,minimal`` runs all on the same
     retrieval; multiple structured thresholds share one judge LLM call per example.
+
+Frontend / one-off query:
+    ``--question "..."`` — retrieve, judge, generate; prints one JSON object (stdout or
+    ``--serve-output``). Use ``--index-dir`` (built via ``python build_retriever_index.py``)
+    so passages are FAISS-matched live with **query encoding only**, not a full re-index.
+    ``--request-json path`` — JSON body ``{"question":"...", "retrieved_context": [...]}``;
+    if ``retrieved_context`` is missing or empty, runs retrieval (``--index-dir`` or corpus).
+    Import ``serve_epistemic_request`` for programmatic use without the batch CLI.
 """
 
 # from __future__ import annotations
@@ -27,6 +35,7 @@ CLI (see ``python epistemic_gated_rag.py --help``):
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import os
@@ -779,6 +788,257 @@ def _record_squad_row(
     }
 
 
+def epistemic_response_json(
+    query: str,
+    passages: List[str],
+    verdict: EpistemicVerdict,
+    response: Optional[str],
+    *,
+    gold_answer: Optional[str] = None,
+    gold_answers: Optional[List[Any]] = None,
+    is_impossible: Optional[bool] = None,
+    ids: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Serializable row matching batch gated JSON (for API / frontend)."""
+    row: Dict[str, Any] = {
+        "question": query,
+        "decision": verdict.decision,
+        "justification": verdict.justification,
+        "relevance_score": verdict.relevance_score,
+        "sufficiency_score": verdict.sufficiency_score,
+        "consistency_score": verdict.consistency_score,
+        "composite_score": verdict.composite_score,
+        "response": response,
+        "retrieved_context": list(passages),
+    }
+    if gold_answer is not None:
+        row["gold_answer"] = gold_answer
+    if gold_answers is not None:
+        row["gold_answers"] = gold_answers
+    if is_impossible is not None:
+        row["is_impossible"] = is_impossible
+    if ids is not None:
+        row["ids"] = ids
+    return row
+
+
+def _verdicts_for_ablation_specs(
+    q: str,
+    passages: List[str],
+    specs: List[AblationSpec],
+    weights: Tuple[float, float, float],
+    structured_caller: Optional[EpistemicJudge],
+    minimal_judge: Optional[EpistemicJudge],
+) -> Dict[str, EpistemicVerdict]:
+    needs_structured = any(s.mode == "structured" for s in specs)
+    structured_raw: Optional[str] = None
+    if needs_structured:
+        assert structured_caller is not None
+        structured_raw = structured_caller.structured_judge_raw(q, passages)
+    out: Dict[str, EpistemicVerdict] = {}
+    for spec in specs:
+        if spec.mode == "structured":
+            assert structured_raw is not None and spec.threshold is not None
+            out[spec.name] = EpistemicJudge.verdict_from_structured_raw(
+                structured_raw,
+                threshold=spec.threshold,
+                weights=weights,
+            )
+        else:
+            assert minimal_judge is not None
+            out[spec.name] = minimal_judge.judge(q, passages)
+    return out
+
+
+def serve_epistemic_request(
+    *,
+    question: str,
+    retrieved_context: Optional[List[str]] = None,
+    squad_json_path: Optional[str] = None,
+    index_dir: Optional[str] = None,
+    top_k: int = 5,
+    embedding_model: str = "all-MiniLM-L6-v2",
+    ablations: Optional[str] = None,
+    judge_mode: str = "structured",
+    threshold: float = 6.0,
+    generator_model: str = "gpt-5-mini",
+    judge_model: str = "gpt-5-mini",
+    rag_outputs_cache_path: Optional[str] = None,
+    example_key: Optional[str] = None,
+    ids: Optional[Any] = None,
+    gold_answer: Optional[str] = None,
+    gold_answers: Optional[List[Any]] = None,
+    is_impossible: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Run epistemic judge (+ retrieval if needed) and optional generation once.
+
+    If ``retrieved_context`` is non-empty, uses those passages (no retrieval).
+
+    Otherwise, if ``index_dir`` is set, loads a pre-built FAISS index from disk
+    (:meth:`rag.DocumentRetriever.save_index` / ``build_retriever_index.py``) and
+    only encodes the question at request time.
+
+    Else falls back to indexing ``squad_json_path`` (or ``default_squad_json_path()``)
+    on every call (slow for interactive use).
+
+    Returns a single example dict if one ablation spec, else
+    ``{"ablations": {name: dict, ...}}``. When several specs all ``ANSWER``,
+    generation runs at most once and the same ``response`` is attached to each.
+    """
+    q = str(question).strip()
+    if not q:
+        raise ValueError("question must be non-empty")
+
+    specs = resolve_ablation_specs(ablations, judge_mode, threshold)
+    weights: Tuple[float, float, float] = (0.35, 0.45, 0.20)
+
+    passages = list(retrieved_context or [])
+    passages = [str(p) for p in passages if p is not None and str(p).strip()]
+    if not passages:
+        idx = str(index_dir).strip() if index_dir else ""
+        if idx:
+            if not os.path.isdir(idx):
+                raise FileNotFoundError(
+                    f"index_dir {idx!r} is not a directory. Build it: python build_retriever_index.py …"
+                )
+            retriever = DocumentRetriever.load_index(idx)
+            passages = retriever.retrieve(q, top_k=top_k)
+        else:
+            corpus = squad_json_path or default_squad_json_path()
+            if not os.path.isfile(corpus):
+                raise FileNotFoundError(
+                    f"No passages provided and no index_dir; SQuAD corpus not found at {corpus!r}. "
+                    "Pass retrieved_context, index_dir, or squad_json_path."
+                )
+            retriever = DocumentRetriever(model_name=embedding_model)
+            docs, _ = load_documents_for_retriever(corpus)
+            retriever.add_documents(docs)
+            passages = retriever.retrieve(q, top_k=top_k)
+
+    cache = (
+        RagOutputsResponseCache.load(rag_outputs_cache_path)
+        if rag_outputs_cache_path
+        else None
+    )
+    generator = OpenAIClient(model=generator_model)
+    judge_client = OpenAIClient(model=judge_model)
+    needs_structured = any(s.mode == "structured" for s in specs)
+    needs_minimal = any(s.mode == "minimal" for s in specs)
+    structured_caller = (
+        EpistemicJudge(judge_client, mode="structured", threshold=6.0, weights=weights)
+        if needs_structured
+        else None
+    )
+    minimal_judge = (
+        EpistemicJudge(judge_client, mode="minimal", threshold=0.0, weights=weights)
+        if needs_minimal
+        else None
+    )
+
+    verdicts = _verdicts_for_ablation_specs(
+        q, passages, specs, weights, structured_caller, minimal_judge
+    )
+
+    shared_response: Optional[str] = None
+    first_answer_verdict: Optional[EpistemicVerdict] = None
+    for v in verdicts.values():
+        if v.should_answer:
+            first_answer_verdict = v
+            break
+    if first_answer_verdict is not None:
+        shared_response = _response_for_verdict(
+            first_answer_verdict,
+            q,
+            passages,
+            generator,
+            cache,
+            example_key=example_key,
+            ids=ids,
+        )
+
+    def row_for(name: str) -> Dict[str, Any]:
+        v = verdicts[name]
+        resp = shared_response if v.should_answer else None
+        return epistemic_response_json(
+            q,
+            passages,
+            v,
+            resp,
+            gold_answer=gold_answer,
+            gold_answers=gold_answers,
+            is_impossible=is_impossible,
+            ids=ids,
+        )
+
+    if len(specs) == 1:
+        return row_for(specs[0].name)
+    return {"ablations": {s.name: row_for(s.name) for s in specs}}
+
+
+def _load_json_request_file(path: str) -> Dict[str, Any]:
+    if path.strip() == "-":
+        data = json.load(sys.stdin)
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Request JSON must be an object, e.g. {\"question\": \"...\"}")
+    return data
+
+
+def _run_serve_mode(args: argparse.Namespace) -> None:
+    if args.question is not None and args.request_json is not None:
+        raise SystemExit("Use either --question or --request-json, not both.")
+    if args.question is not None:
+        payload: Dict[str, Any] = {"question": args.question}
+    else:
+        assert args.request_json is not None
+        payload = _load_json_request_file(args.request_json)
+
+    q = str(payload.get("question", "")).strip()
+    if not q:
+        raise SystemExit("Missing or empty \"question\" in request.")
+
+    passages_in = _passages_from_retrieval_ex(payload)
+    ga = _gold_from_retrieval_ex(payload)
+    ganswers = payload.get("gold_answers")
+    idx_dir = args.index_dir
+    if not idx_dir and isinstance(payload.get("index_dir"), str):
+        idx_dir = payload["index_dir"].strip() or None
+    out = serve_epistemic_request(
+        question=q,
+        retrieved_context=passages_in if passages_in else None,
+        squad_json_path=args.squad_json,
+        index_dir=idx_dir,
+        top_k=args.top_k,
+        embedding_model=args.embedding_model,
+        ablations=args.ablations,
+        judge_mode=args.judge_mode,
+        threshold=args.threshold,
+        generator_model=args.generator_model,
+        judge_model=args.judge_model,
+        rag_outputs_cache_path=args.rag_cache
+        if os.path.isfile(args.rag_cache)
+        else None,
+        example_key=str(payload.get("example_key", "")).strip() or None,
+        ids=payload.get("ids"),
+        gold_answer=ga if ga.strip() else None,
+        gold_answers=ganswers if isinstance(ganswers, list) and ganswers else None,
+        is_impossible=payload.get("is_impossible")
+        if "is_impossible" in payload
+        else None,
+    )
+
+    text = json.dumps(out, ensure_ascii=False, indent=2)
+    if args.serve_output:
+        with open(args.serve_output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"Wrote JSON to {args.serve_output!r}")
+    else:
+        print(text)
+
+
 def _write_ablation_outputs(
     nested: Dict[str, Dict[str, Any]],
     specs: List[AblationSpec],
@@ -881,11 +1141,48 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=5,
         help="Retriever top-k when indexing SQuAD.",
     )
+    p.add_argument(
+        "--question",
+        default=None,
+        help=(
+            "Frontend / one-off: run retrieve → epistemic judge → generate for this "
+            "question; print JSON (or use --serve-output). Uses --squad-json / default corpus."
+        ),
+    )
+    p.add_argument(
+        "--request-json",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Frontend / test JSON: object with \"question\" and optional "
+            "\"retrieved_context\" / \"retrieved_passages\". If passages absent or empty, "
+            "runs full retrieval like --question. Use path \"-\" to read stdin."
+        ),
+    )
+    p.add_argument(
+        "--serve-output",
+        default=None,
+        metavar="PATH",
+        help="With --question or --request-json, write JSON here instead of printing.",
+    )
+    p.add_argument(
+        "--index-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Pre-built FAISS index directory (from ``python build_retriever_index.py …``). "
+            "Serve / live queries only encode the question + search."
+        ),
+    )
     return p
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+    if args.question is not None or args.request_json is not None:
+        _run_serve_mode(args)
+        return
+
     specs = resolve_ablation_specs(args.ablations, args.judge_mode, args.threshold)
     weights: Tuple[float, float, float] = (0.35, 0.45, 0.20)
 

@@ -3,7 +3,7 @@ import json
 import os
 import faiss
 import numpy as np
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tqdm import tqdm
 
@@ -60,9 +60,10 @@ class OpenAIClient():
 
 class DocumentRetriever():
     def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
+        self.model_name = model_name
         self.embedding_model = SentenceTransformer(model_name)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
-        
+
         # Initialize FAISS Index (L2 distance)
         self.index = faiss.IndexFlatIP(self.embedding_dim)
         self.documents: List[str] = []
@@ -98,7 +99,46 @@ class DocumentRetriever():
             if idx != -1 and idx < len(self.documents):
                 retrieved_docs.append(self.documents[idx])
         return retrieved_docs
-        
+
+    def save_index(self, directory: str) -> None:
+        """
+        Persist FAISS index and chunk texts for :meth:`load_index` (live query = encode question only).
+        """
+        os.makedirs(directory, exist_ok=True)
+        if self.index.ntotal != len(self.documents):
+            raise ValueError(
+                f"Index / document count mismatch: ntotal={self.index.ntotal} len={len(self.documents)}"
+            )
+        faiss.write_index(self.index, os.path.join(directory, "faiss.index"))
+        with open(os.path.join(directory, "documents.json"), "w", encoding="utf-8") as f:
+            json.dump(self.documents, f, ensure_ascii=False)
+        meta = {"model_name": self.model_name, "ntotal": int(self.index.ntotal)}
+        with open(os.path.join(directory, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+    @classmethod
+    def load_index(cls, directory: str) -> "DocumentRetriever":
+        """Reload a directory written by :meth:`save_index`; :meth:`retrieve` encodes only the query."""
+        meta_path = os.path.join(directory, "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"No meta.json in {directory!r} — run --build-retriever-index first.")
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        model_name = str(meta.get("model_name", "all-MiniLM-L6-v2"))
+        r = cls(model_name=model_name)
+        idx_path = os.path.join(directory, "faiss.index")
+        r.index = faiss.read_index(idx_path)
+        with open(os.path.join(directory, "documents.json"), encoding="utf-8") as f:
+            docs = json.load(f)
+        if not isinstance(docs, list):
+            raise ValueError("documents.json must be a JSON array of strings.")
+        r.documents = [str(d) for d in docs]
+        if r.index.ntotal != len(r.documents):
+            raise ValueError(
+                f"Loaded index ntotal={r.index.ntotal} != len(documents)={len(r.documents)}"
+            )
+        return r
+
 
 class VanillaRAG:
     def __init__(self, retriever: DocumentRetriever, generator: OpenAIClient):
@@ -126,18 +166,59 @@ def load_squad_json_records(json_path: str) -> List[Dict[str, Any]]:
     return data
 
 
+def passages_from_squad_record(rec: Dict[str, Any]) -> List[str]:
+    """Normalize ``context`` on a SQuAD record to a list of non-empty passage strings."""
+    ctx = rec.get("context")
+    if ctx is None:
+        return []
+    if isinstance(ctx, str):
+        s = ctx.strip()
+        return [s] if s else []
+    if isinstance(ctx, list):
+        out: List[str] = []
+        for p in ctx:
+            if p is None:
+                continue
+            s = str(p).strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
 def squad_records_to_unique_passages(records: List[Dict[str, Any]]) -> List[str]:
     """Flatten context passages across examples; preserve first-seen order."""
     seen = set()
     out: List[str] = []
     for rec in records:
-        for p in rec.get("context") or []:
-            if not isinstance(p, str):
-                p = str(p)
-            p = p.strip()
-            if p and p not in seen:
+        if not isinstance(rec, dict):
+            continue
+        for p in passages_from_squad_record(rec):
+            if p not in seen:
                 seen.add(p)
                 out.append(p)
+    return out
+
+
+def load_squad_passages_union(json_paths: Sequence[str]) -> List[str]:
+    """
+    Unique passage strings across one or more SQuAD JSON array files.
+
+    Order: first occurrence wins globally (train before test if listed that way).
+    """
+    seen: set = set()
+    out: List[str] = []
+    for path in json_paths:
+        records = load_squad_json_records(path)
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            for p in passages_from_squad_record(rec):
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+        print(f"[Dataset] merged passages from {path!r} (unique so far: {len(out)})")
+    print(f"[Dataset] union over {len(json_paths)} file(s): {len(out)} unique passages")
     return out
 
 

@@ -21,3 +21,43 @@ python rag.py --resume                    # after interruption, if retrieval JSO
 python epistemic_gated_rag.py             # uses squad_retrieval.json when present
 python feature_gated_rag.py               # reads squad_retrieval.json by default
 ```
+
+## Editing `app.py` (Streamlit UI)
+
+`app.py` is the **Streamlit** demo only. It is safe to change layout, labels, sliders, and how results are displayed. Keep **long-running / batch** work in the other scripts unless you intentionally move logic here.
+
+### Run the app
+
+```bash
+streamlit run app.py
+```
+
+From the repo root (same directory as `app.py`). Requires the same `.env` as `rag.py` (**`OPENAI_API_KEY`**, optional **`BASE_URL`**) because the pipeline calls the OpenAI-compatible API.
+
+### What `app.py` does today
+
+- Imports **`build_rag_pipeline`** and **`default_squad_json_path`** from **`rag.py`** (not from `epistemic_gated_rag.py`).
+- On first **Ask**, it builds a full RAG pipeline against **`default_squad_json_path()`** (see **Paths and defaults** above: env `SQUAD_JSON`, then `squad_test_sampled.json`, then `squad_test.json`).
+- **`st.session_state.rag_pipeline`** caches that pipeline for the session so indexing runs **once** per browser session, not on every question.
+
+### Good places for a partner to edit
+
+| Area | File | Notes |
+|------|------|--------|
+| Page title, layout, copy | `app.py` | `st.set_page_config`, `st.title`, `st.write`, sidebar |
+| Retrieval depth | `app.py` | `top_k` slider passed into `answer(..., top_k=...)` |
+| Corpus path | Prefer env | Set **`SQUAD_JSON`** so `default_squad_json_path()` picks your file without hard-coding in `app.py` |
+| Embedding / LLM model names | `app.py` | Arguments to `build_rag_pipeline(...)` (lines ~29–32) |
+
+### If you want epistemic gating or a pre-built index in the UI
+
+Do **not** duplicate judge logic in `app.py`. Import and call **`serve_epistemic_request`** from **`epistemic_gated_rag.py`** (see that file’s docstring and `--question` / `--index-dir` CLI). Typical pattern:
+
+1. One-time (or CI): **`python build_retriever_index.py ./your_index_dir`** — merges train/test passages by default.
+2. In `app.py`: call `serve_epistemic_request(question=..., index_dir="./your_index_dir", ...)` and render the returned JSON fields (`decision`, `justification`, `relevance_score`, …, `response`, `retrieved_context`).
+
+That keeps **`app.py`** as presentation and **`epistemic_gated_rag.py`** / **`rag.py`** as the source of truth for behavior.
+
+### Dependencies for Streamlit
+
+`streamlit` is listed in **`requirements.txt`**. Install with the rest of the project (e.g. `pip install -r requirements.txt`) in the same environment you use for `rag.py`.
