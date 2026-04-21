@@ -6,5 +6,6 @@ __pycache__/".env"
 ".env" 
 ".xlsx"
 "*.xlsx" 
-"*.json" 
+*.json
 __pycache__/
+squad_index/
